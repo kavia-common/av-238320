@@ -33,7 +33,7 @@ const char *kCameraServiceDisabledProperty = "config.disable_cameraservice";
 
 status_t CameraUtils::getRotationTransform(const CameraMetadata& staticInfo,
         int mirrorMode,  bool enableTransformInverseDisplay, /*out*/int32_t* transform) {
-    ALOGV("%s", __FUNCTION__);
+    ALOGV("%s (TEST-ONLY)", __FUNCTION__);
 
     if (transform == NULL) {
         ALOGW("%s: null transform", __FUNCTION__);
