@@ -1,1 +1,3 @@
 Validates real_path glob fallback fix for FUSE ephemeral resolution.
+
+# Test-only change: touch file for CI validation.
