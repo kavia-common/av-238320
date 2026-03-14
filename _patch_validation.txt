@@ -1,0 +1,1 @@
+Validates real_path glob fallback fix for FUSE ephemeral resolution.
