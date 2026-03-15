@@ -32,8 +32,12 @@
 
 namespace android {
 
-// NOTE: This file lives under av/camera; small local comments may be added here for maintenance,
-// but avoid creating duplicate/placeholder camera.cpp files at the repository root.
+/*
+ * NOTE: This file lives under av/camera; small local comments may be added here for maintenance,
+ * but avoid creating duplicate/placeholder camera.cpp files at the repository root.
+ *
+ * Keep edits in this file non-functional unless explicitly required (e.g. comment-only changes).
+ */
 
 // client singleton for camera service binder interface
 Mutex Camera::mLock;
