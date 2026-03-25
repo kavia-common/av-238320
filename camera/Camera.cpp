@@ -17,31 +17,60 @@
 
 //#define LOG_NDEBUG 0
 #define LOG_TAG "Camera"
+// TESTING COMMENT: Added per user request to validate patch application (no functional impact).
 #include <utils/Log.h>
 #include <utils/threads.h>
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
 #include <binder/IMemory.h>
 
-#include <Camera.h>
-#include <android/hardware/ICameraService.h>
-#include <android/hardware/ICamera.h>
+#include <camera/Camera.h>
+#include <camera/ICameraRecordingProxyListener.h>
+#include <camera/ICameraService.h>
 
-#include <gui/IGraphicBufferProducer.h>
+#include <gui/ISurfaceTexture.h>
 #include <gui/Surface.h>
 
 namespace android {
 
-Camera::Camera(int cameraId)
-    : CameraBase(cameraId)
+// client singleton for camera service binder interface
+Mutex Camera::mLock;
+sp<ICameraService> Camera::mCameraService;
+sp<Camera::DeathNotifier> Camera::mDeathNotifier;
+
+// establish binder interface to camera service
+const sp<ICameraService>& Camera::getCameraService()
 {
+    Mutex::Autolock _l(mLock);
+    if (mCameraService.get() == 0) {
+        sp<IServiceManager> sm = defaultServiceManager();
+        sp<IBinder> binder;
+        do {
+            binder = sm->getService(String16("media.camera"));
+            if (binder != 0)
+                break;
+            ALOGW("CameraService not published, waiting...");
+            usleep(500000); // 0.5 s
+        } while(true);
+        if (mDeathNotifier == NULL) {
+            mDeathNotifier = new DeathNotifier();
+        }
+        binder->linkToDeath(mDeathNotifier);
+        mCameraService = interface_cast<ICameraService>(binder);
+    }
+    ALOGE_IF(mCameraService==0, "no CameraService!?");
+    return mCameraService;
 }
 
-CameraTraits<Camera>::TCamConnectService CameraTraits<Camera>::fnConnectService =
-        &::android::hardware::ICameraService::connect;
+// ---------------------------------------------------------------------------
+
+Camera::Camera()
+{
+    init();
+}
 
 // construct a camera client from an existing camera remote
-sp<Camera> Camera::create(const sp<::android::hardware::ICamera>& camera)
+sp<Camera> Camera::create(const sp<ICamera>& camera)
 {
      ALOGV("create");
      if (camera == 0) {
@@ -49,14 +78,19 @@ sp<Camera> Camera::create(const sp<::android::hardware::ICamera>& camera)
          return 0;
      }
 
-    sp<Camera> c = new Camera(-1);
+    sp<Camera> c = new Camera();
     if (camera->connect(c) == NO_ERROR) {
         c->mStatus = NO_ERROR;
         c->mCamera = camera;
-        IInterface::asBinder(camera)->linkToDeath(c);
+        camera->asBinder()->linkToDeath(c);
         return c;
     }
     return 0;
+}
+
+void Camera::init()
+{
+    mStatus = UNKNOWN_ERROR;
 }
 
 Camera::~Camera()
@@ -69,75 +103,125 @@ Camera::~Camera()
     // deadlock if we call any method of ICamera here.
 }
 
-sp<Camera> Camera::connect(int cameraId, int targetSdkVersion, int rotationOverride,
-        bool forceSlowJpegMode, const AttributionSourceState& clientAttribution,
-        int32_t devicePolicy)
+int32_t Camera::getNumberOfCameras()
 {
-    return CameraBaseT::connect(cameraId, targetSdkVersion, rotationOverride,
-            forceSlowJpegMode, clientAttribution, devicePolicy);
+    const sp<ICameraService>& cs = getCameraService();
+    if (cs == 0) return 0;
+    return cs->getNumberOfCameras();
+}
+
+status_t Camera::getCameraInfo(int cameraId,
+                               struct CameraInfo* cameraInfo) {
+    const sp<ICameraService>& cs = getCameraService();
+    if (cs == 0) return UNKNOWN_ERROR;
+    return cs->getCameraInfo(cameraId, cameraInfo);
+}
+
+sp<Camera> Camera::connect(int cameraId)
+{
+    ALOGV("connect");
+    sp<Camera> c = new Camera();
+    const sp<ICameraService>& cs = getCameraService();
+    if (cs != 0) {
+        c->mCamera = cs->connect(c, cameraId);
+    }
+    if (c->mCamera != 0) {
+        c->mCamera->asBinder()->linkToDeath(c);
+        c->mStatus = NO_ERROR;
+    } else {
+        c.clear();
+    }
+    return c;
+}
+
+void Camera::disconnect()
+{
+    ALOGV("disconnect");
+    if (mCamera != 0) {
+        mCamera->disconnect();
+        mCamera->asBinder()->unlinkToDeath(this);
+        mCamera = 0;
+    }
 }
 
 status_t Camera::reconnect()
 {
     ALOGV("reconnect");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
     return c->connect(this);
 }
 
+sp<ICamera> Camera::remote()
+{
+    return mCamera;
+}
+
 status_t Camera::lock()
 {
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
     return c->lock();
 }
 
 status_t Camera::unlock()
 {
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
     return c->unlock();
 }
 
-// pass the Surface to the camera service
-status_t Camera::setPreviewTarget(const sp<SurfaceType>& target) {
-    ALOGV("setPreviewTarget(%p)", target.get());
-    sp<::android::hardware::ICamera> c = mCamera;
+// pass the buffered Surface to the camera service
+status_t Camera::setPreviewDisplay(const sp<Surface>& surface)
+{
+    ALOGV("setPreviewDisplay(%p)", surface.get());
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
-    ALOGD_IF(target == 0, "app passed NULL surface");
-    return c->setPreviewTarget(target);
+    if (surface != 0) {
+        return c->setPreviewDisplay(surface);
+    } else {
+        ALOGD("app passed NULL surface");
+        return c->setPreviewDisplay(0);
+    }
 }
 
-status_t Camera::setVideoTarget(const sp<SurfaceType>& target) {
-    ALOGV("setVideoTarget(%p)", target.get());
-    sp<::android::hardware::ICamera> c = mCamera;
+// pass the buffered ISurfaceTexture to the camera service
+status_t Camera::setPreviewTexture(const sp<ISurfaceTexture>& surfaceTexture)
+{
+    ALOGV("setPreviewTexture(%p)", surfaceTexture.get());
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
-    ALOGD_IF(target == 0, "app passed NULL video surface");
-    return c->setVideoTarget(target);
+    if (surfaceTexture != 0) {
+        return c->setPreviewTexture(surfaceTexture);
+    } else {
+        ALOGD("app passed NULL surface");
+        return c->setPreviewTexture(0);
+    }
 }
 
 // start preview mode
 status_t Camera::startPreview()
 {
     ALOGV("startPreview");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
     return c->startPreview();
 }
 
-status_t Camera::setVideoBufferMode(int32_t videoBufferMode)
+status_t Camera::storeMetaDataInBuffers(bool enabled)
 {
-    ALOGV("setVideoBufferMode: %d", videoBufferMode);
-    sp <::android::hardware::ICamera> c = mCamera;
+    ALOGV("storeMetaDataInBuffers: %s",
+            enabled? "true": "false");
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
-    return c->setVideoBufferMode(videoBufferMode);
+    return c->storeMetaDataInBuffers(enabled);
 }
 
-// start recording mode, must call setPreviewTarget first
+// start recording mode, must call setPreviewDisplay first
 status_t Camera::startRecording()
 {
     ALOGV("startRecording");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
     return c->startRecording();
 }
@@ -146,7 +230,7 @@ status_t Camera::startRecording()
 void Camera::stopPreview()
 {
     ALOGV("stopPreview");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return;
     c->stopPreview();
 }
@@ -155,7 +239,11 @@ void Camera::stopPreview()
 void Camera::stopRecording()
 {
     ALOGV("stopRecording");
-    sp <::android::hardware::ICamera> c = mCamera;
+    {
+        Mutex::Autolock _l(mLock);
+        mRecordingProxyListener.clear();
+    }
+    sp <ICamera> c = mCamera;
     if (c == 0) return;
     c->stopRecording();
 }
@@ -164,32 +252,16 @@ void Camera::stopRecording()
 void Camera::releaseRecordingFrame(const sp<IMemory>& mem)
 {
     ALOGV("releaseRecordingFrame");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return;
     c->releaseRecordingFrame(mem);
-}
-
-void Camera::releaseRecordingFrameHandle(native_handle_t* handle)
-{
-    ALOGV("releaseRecordingFrameHandle");
-    sp <::android::hardware::ICamera> c = mCamera;
-    if (c == 0) return;
-    c->releaseRecordingFrameHandle(handle);
-}
-
-void Camera::releaseRecordingFrameHandleBatch(
-        const std::vector<native_handle_t*> handles) {
-    ALOGV("releaseRecordingFrameHandleBatch");
-    sp <::android::hardware::ICamera> c = mCamera;
-    if (c == 0) return;
-    c->releaseRecordingFrameHandleBatch(handles);
 }
 
 // get preview state
 bool Camera::previewEnabled()
 {
     ALOGV("previewEnabled");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return false;
     return c->previewEnabled();
 }
@@ -198,7 +270,7 @@ bool Camera::previewEnabled()
 bool Camera::recordingEnabled()
 {
     ALOGV("recordingEnabled");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return false;
     return c->recordingEnabled();
 }
@@ -206,7 +278,7 @@ bool Camera::recordingEnabled()
 status_t Camera::autoFocus()
 {
     ALOGV("autoFocus");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
     return c->autoFocus();
 }
@@ -214,7 +286,7 @@ status_t Camera::autoFocus()
 status_t Camera::cancelAutoFocus()
 {
     ALOGV("cancelAutoFocus");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
     return c->cancelAutoFocus();
 }
@@ -223,7 +295,7 @@ status_t Camera::cancelAutoFocus()
 status_t Camera::takePicture(int msgType)
 {
     ALOGV("takePicture: 0x%x", msgType);
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
     return c->takePicture(msgType);
 }
@@ -232,7 +304,7 @@ status_t Camera::takePicture(int msgType)
 status_t Camera::setParameters(const String8& params)
 {
     ALOGV("setParameters");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
     return c->setParameters(params);
 }
@@ -242,8 +314,8 @@ String8 Camera::getParameters() const
 {
     ALOGV("getParameters");
     String8 params;
-    sp <::android::hardware::ICamera> c = mCamera;
-    if (c != 0) params = c->getParameters();
+    sp <ICamera> c = mCamera;
+    if (c != 0) params = mCamera->getParameters();
     return params;
 }
 
@@ -251,7 +323,7 @@ String8 Camera::getParameters() const
 status_t Camera::sendCommand(int32_t cmd, int32_t arg1, int32_t arg2)
 {
     ALOGV("sendCommand");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return NO_INIT;
     return c->sendCommand(cmd, arg1, arg2);
 }
@@ -262,38 +334,31 @@ void Camera::setListener(const sp<CameraListener>& listener)
     mListener = listener;
 }
 
+void Camera::setRecordingProxyListener(const sp<ICameraRecordingProxyListener>& listener)
+{
+    Mutex::Autolock _l(mLock);
+    mRecordingProxyListener = listener;
+}
+
 void Camera::setPreviewCallbackFlags(int flag)
 {
     ALOGV("setPreviewCallbackFlags");
-    sp <::android::hardware::ICamera> c = mCamera;
+    sp <ICamera> c = mCamera;
     if (c == 0) return;
-    c->setPreviewCallbackFlag(flag);
-}
-
-status_t Camera::setPreviewCallbackTarget(const sp<SurfaceType>& target) {
-    sp<::android::hardware::ICamera> c = mCamera;
-    if (c == 0) return NO_INIT;
-    return c->setPreviewCallbackTarget(target);
-}
-
-status_t Camera::setAudioRestriction(int32_t mode)
-{
-    sp <::android::hardware::ICamera> c = mCamera;
-    if (c == 0) return NO_INIT;
-    return c->setAudioRestriction(mode);
-}
-
-int32_t Camera::getGlobalAudioRestriction()
-{
-    sp <::android::hardware::ICamera> c = mCamera;
-    if (c == 0) return NO_INIT;
-    return c->getGlobalAudioRestriction();
+    mCamera->setPreviewCallbackFlag(flag);
 }
 
 // callback from camera service
 void Camera::notifyCallback(int32_t msgType, int32_t ext1, int32_t ext2)
 {
-    return CameraBaseT::notifyCallback(msgType, ext1, ext2);
+    sp<CameraListener> listener;
+    {
+        Mutex::Autolock _l(mLock);
+        listener = mListener;
+    }
+    if (listener != NULL) {
+        listener->notify(msgType, ext1, ext2);
+    }
 }
 
 // callback from camera service when frame or image is ready
@@ -313,12 +378,24 @@ void Camera::dataCallback(int32_t msgType, const sp<IMemory>& dataPtr,
 // callback from camera service when timestamped frame is ready
 void Camera::dataCallbackTimestamp(nsecs_t timestamp, int32_t msgType, const sp<IMemory>& dataPtr)
 {
+    // If recording proxy listener is registered, forward the frame and return.
+    // The other listener (mListener) is ignored because the receiver needs to
+    // call releaseRecordingFrame.
+    sp<ICameraRecordingProxyListener> proxylistener;
+    {
+        Mutex::Autolock _l(mLock);
+        proxylistener = mRecordingProxyListener;
+    }
+    if (proxylistener != NULL) {
+        proxylistener->dataCallbackTimestamp(timestamp, msgType, dataPtr);
+        return;
+    }
+
     sp<CameraListener> listener;
     {
         Mutex::Autolock _l(mLock);
         listener = mListener;
     }
-
     if (listener != NULL) {
         listener->postDataTimestamp(timestamp, msgType, dataPtr);
     } else {
@@ -327,38 +404,16 @@ void Camera::dataCallbackTimestamp(nsecs_t timestamp, int32_t msgType, const sp<
     }
 }
 
-void Camera::recordingFrameHandleCallbackTimestamp(nsecs_t timestamp, native_handle_t* handle)
-{
-    sp<CameraListener> listener;
-    {
-        Mutex::Autolock _l(mLock);
-        listener = mListener;
-    }
-
-    if (listener != NULL) {
-        listener->postRecordingFrameHandleTimestamp(timestamp, handle);
-    } else {
-        ALOGW("No listener was set. Drop a recording frame.");
-        releaseRecordingFrameHandle(handle);
-    }
+void Camera::binderDied(const wp<IBinder>& who) {
+    ALOGW("ICamera died");
+    notifyCallback(CAMERA_MSG_ERROR, CAMERA_ERROR_SERVER_DIED, 0);
 }
 
-void Camera::recordingFrameHandleCallbackTimestampBatch(
-        const std::vector<nsecs_t>& timestamps,
-        const std::vector<native_handle_t*>& handles)
-{
-    sp<CameraListener> listener;
-    {
-        Mutex::Autolock _l(mLock);
-        listener = mListener;
-    }
-
-    if (listener != NULL) {
-        listener->postRecordingFrameHandleTimestampBatch(timestamps, handles);
-    } else {
-        ALOGW("No listener was set. Drop a batch of recording frames.");
-        releaseRecordingFrameHandleBatch(handles);
-    }
+void Camera::DeathNotifier::binderDied(const wp<IBinder>& who) {
+    ALOGV("binderDied");
+    Mutex::Autolock _l(Camera::mLock);
+    Camera::mCameraService.clear();
+    ALOGW("Camera server died!");
 }
 
 sp<ICameraRecordingProxy> Camera::getRecordingProxy() {
@@ -366,9 +421,10 @@ sp<ICameraRecordingProxy> Camera::getRecordingProxy() {
     return new RecordingProxy(this);
 }
 
-status_t Camera::RecordingProxy::startRecording()
+status_t Camera::RecordingProxy::startRecording(const sp<ICameraRecordingProxyListener>& listener)
 {
     ALOGV("RecordingProxy::startRecording");
+    mCamera->setRecordingProxyListener(listener);
     mCamera->reconnect();
     return mCamera->startRecording();
 }
@@ -377,6 +433,12 @@ void Camera::RecordingProxy::stopRecording()
 {
     ALOGV("RecordingProxy::stopRecording");
     mCamera->stopRecording();
+}
+
+void Camera::RecordingProxy::releaseRecordingFrame(const sp<IMemory>& mem)
+{
+    ALOGV("RecordingProxy::releaseRecordingFrame");
+    mCamera->releaseRecordingFrame(mem);
 }
 
 Camera::RecordingProxy::RecordingProxy(const sp<Camera>& camera)
